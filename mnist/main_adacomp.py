@@ -5,13 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.optim.lr_scheduler import StepLR
 import time
+from torch.optim.lr_scheduler import StepLR
+import numpy as np
 # import visdom
 # vis = visdom.Visdom(env='adaptive_lr')
-# win = vis.line(X=[0.], Y=[0.], win='train_loss_ada', opts={'title':'adadelta'})
+
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
@@ -38,32 +40,57 @@ class Net(nn.Module):
         return output
 
 
-def train(args, model, device, train_loader, optimizer, epoch):
+def grad_norm(parameters):
+    total_norm = 0
+    for p in parameters:
+        param_norm = p.grad.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
+
+def lr_adap(lr, loss_diff, norm):
+    new_lr = (lr/2 * norm**2 + loss_diff) / (norm**2 + 1e-6)
+    return new_lr.data.item()
+
+losses = [0, 0]
+
+def train(args, model, device, optimizer, train_loader, epoch, lr, losses_neib):
     model.train()
-    scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    loss_diff = 0.
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
         loss.backward()
+        losses_neib[0] = losses_neib[1]
+        losses_neib[1] = loss
+        loss_diff += torch.tensor(losses_neib[0] - losses_neib[1])
+        # lr = lr_adap(lr, loss_diff, grad_norm(model.parameters()))
         nn.utils.clip_grad_norm_(model.parameters(), 10)
         optimizer.step()
-        # scheduler.step()
         if batch_idx % args.log_interval == 0:
+            amplify1 = 1 / 2 + (torch.atan(torch.as_tensor(loss_diff + 1 / lr))) / (5 * 3.14)
+            amplify21 = 1 / 4 - (torch.atan(torch.as_tensor(lr))) / (0.6 * 3.14)
+            amplify22 = 1 / 4 - (torch.atan(torch.as_tensor(-loss_diff + 1 / lr))) / (5.5 * 3.14)
+            lr = lr / 2 + (loss_diff > 10 ** (-5)) * lr * amplify1 + (loss_diff < -10 ** (-5)) * lr * (
+                    amplify21 + amplify22)
+            print(lr.data.item(), loss_diff.data.item(), grad_norm(model.parameters()))
+            optimizer = optim.SGD(model.parameters(), lr=lr)
+            loss_diff = 0.
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
             # vis.line([loss.item()], [(epoch - 1)*len(train_loader) + batch_idx],
-            #          win='train_loss_adadelta',
-            #          opts={'title':'adadelta'},
+            #          win='train_loss_compenlr',
+            #          opts={'title':'compen','legend':['loss']},
             #          update= None if (epoch - 1)*len(train_loader) + batch_idx == 0 else 'append')
-            # train_loss.append(loss.item())
             if args.dry_run:
                 break
-    # return train_loss
+    return lr, losses_neib
 
-def test(model, device, test_loader):
+
+def test(model, device, test_loader, epoch):
     model.eval()
     test_loss = 0
     correct = 0
@@ -80,6 +107,10 @@ def test(model, device, test_loader):
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
+    # vis.line([test_loss], [epoch],
+    #          win='test_loss_compenlr',
+    #          opts={'title': 'compen', 'legend': ['test_loss']},
+    #          update= 'append')
     return test_loss, 100. * correct / len(test_loader.dataset)
 
 
@@ -134,28 +165,30 @@ def main():
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
 
     model = Net().to(device)
-    optimizer = optim.Adamax(model.parameters(), lr=args.lr)
-    # optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
+    lr = args.lr
+    optimizer = optim.SGD(model.parameters(), lr=args.lr)
 
-    scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    # train_loss = []
+    # optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
+    # scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     test_loss = []
     test_acc = []
     begin = time.perf_counter()
+    losses_neib = [0, 0]
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, optimizer, epoch)
-        a, b = test(model, device, test_loader)
+        lr, losses_neib = train(args, model, device, optimizer, train_loader, epoch,
+                                        lr, losses_neib)
+        a, b = test(model, device, test_loader, epoch)
         test_loss.append(a)
         test_acc.append(b)
         # scheduler.step()
     end = time.perf_counter()
-    with open('../data/MNIST/results_adamax.txt', 'a+') as fl:
-        fl.write('\n Optimizer is Adamax, Seed is {}, LR is {}, batch size is {} \n test loss is{} \n test acc is {} \n time is {} \n\n'.
+    with open('../data/MNIST/results_adacomp.txt', 'a+') as fl:
+        fl.write('Optimizer is AdaCompen, Seed is {}, LR is {}, batch size is {} \n test loss is{} \n test acc is {} \n time is {} \n\n'.
                  format(args.seed, args.lr, args.batch_size, test_loss, test_acc, end-begin))
+
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
 
 
 if __name__ == '__main__':
     main()
-
